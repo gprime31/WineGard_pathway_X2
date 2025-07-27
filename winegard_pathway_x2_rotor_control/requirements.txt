@@ -1,0 +1,5 @@
+#Package requirements for winegard_pathway_x2_rotor_control.py
+
+pyserial
+regex
+socket
