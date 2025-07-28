@@ -14,8 +14,8 @@ class CarryoutRotor:
         self.ser = serial.Serial(serial_port, baudrate, timeout=1)
         self.lock = threading.Lock()
         self.initialized = False
-        self.last_az = 0.0
-        self.last_el = 0.0
+        self.last_az_scaled = 0  # integer scaled (e.g. 17000)
+        self.last_el_scaled = 0
 
     def initialize(self):
         if not self.initialized:
@@ -26,50 +26,50 @@ class CarryoutRotor:
                 while self.ser.in_waiting:
                     response += self.ser.read(self.ser.in_waiting)
                     time.sleep(0.1)
-                response_str = response.decode('ascii', errors='ignore')
+                response_str = response.decode('utf-8', errors='ignore')
 
             if "MOT>" in response_str:
                 print("Already in 'mot' submenu, skipping 'mot' command")
                 self.initialized = True
             else:
-                response = self.send_command('mot')
-                print(f"Sent 'mot' -> Response: {response.strip()}")
+                self.send_command('mot')
                 time.sleep(1.0)
                 self.initialized = True
 
     def send_command(self, cmd):
         full_cmd = cmd + '\r\n'
         with self.lock:
-            self.ser.write(full_cmd.encode('ascii'))
+            self.ser.write(full_cmd.encode('utf-8'))
             time.sleep(1.0)
             response = b''
             while self.ser.in_waiting:
                 response += self.ser.read(self.ser.in_waiting)
                 time.sleep(0.1)
-            response_str = response.decode('ascii', errors='ignore')
+            response_str = response.decode('utf-8', errors='ignore')
             print(f"Sent '{cmd}' -> Response:\n{response_str.strip()}")
 
+            # Parse scaled values from lines like: "m 0  a 17000  np 111714"
             if cmd.startswith('a 0'):
-                matches = re.findall(r'Angle\[0\]\s*=\s*([-+]?\d*\.\d+|\d+)', response_str)
-                if matches:
-                    self.last_az = float(matches[0])
-                    print(f"Parsed azimuth: {self.last_az}")
+                match = re.search(r'\bm\s+0\s+a\s+(\d+)', response_str)
+                if match:
+                    self.last_az_scaled = int(match.group(1))
+                    print(f"Parsed azimuth scaled value: {self.last_az_scaled}")
                 else:
-                    print("Warning: Could not parse azimuth angle!")
+                    print("Warning: Could not parse azimuth from response!")
+
             elif cmd.startswith('a 1'):
-                matches = re.findall(r'Angle\[1\]\s*=\s*([-+]?\d*\.\d+|\d+)', response_str)
-                if matches:
-                    self.last_el = float(matches[0])
-                    print(f"Parsed elevation: {self.last_el}")
+                match = re.search(r'\bm\s+1\s+a\s+(\d+)', response_str)
+                if match:
+                    self.last_el_scaled = int(match.group(1))
+                    print(f"Parsed elevation scaled value: {self.last_el_scaled}")
                 else:
-                    print("Warning: Could not parse elevation angle!")
+                    print("Warning: Could not parse elevation from response!")
 
             return response_str
 
     def move_to(self, az, el):
         self.initialize()
-        self.send_command('')  # ENTER
-        # Send with 2 decimal places (floats)
+        self.send_command('')  # ENTER to prompt
         self.send_command(f'a 0 {az:.2f}')
         self.send_command('')  # ENTER
         time.sleep(1.0)
@@ -78,9 +78,9 @@ class CarryoutRotor:
 
     def get_position(self):
         self.initialize()
-        self.send_command('a 0')  # get azimuth
-        self.send_command('a 1')  # get elevation
-        return (self.last_az, self.last_el)
+        # Just return the last parsed scaled values
+        return (self.last_az_scaled, self.last_el_scaled)
+
 
 def handle_client(conn, addr, rotor):
     print(f"Connection from {addr}")
@@ -90,22 +90,26 @@ def handle_client(conn, addr, rotor):
             if not data:
                 break
             try:
-                cmd = data.decode('ascii').strip()
+                cmd = data.decode('utf-8').strip()
                 if cmd.startswith('P'):
-                    # Accept decimal degrees from GPredict
                     _, az_str, el_str = cmd.split()
                     az = float(az_str)
                     el = float(el_str)
                     rotor.move_to(az, el)
                     conn.sendall(b'RPRT 0\n')
+
                 elif cmd.startswith('p'):
-                    az, el = rotor.get_position()
-                    print(f"Sending position to GPredict: az={az:.2f}, el={el:.2f}")
-                    response = f"{az:.2f} {el:.2f}\n"
-                    conn.sendall(response.encode('ascii'))
+                    az_scaled, el_scaled = rotor.get_position()
+                    az_deg = az_scaled / 100.0
+                    el_deg = el_scaled / 100.0
+                    response = f"{az_deg:.2f}\n{el_deg:.2f}\n"
+                    print(f"Sending position to Gpredict: {response.strip()}")
+                    conn.sendall(response.encode('utf-8'))
                     time.sleep(0.05)
+
                 else:
                     conn.sendall(b'RPRT 0\n')
+
             except Exception as e:
                 print(f"Error: {e}")
                 conn.sendall(b'RPRT 1\n')
@@ -113,10 +117,11 @@ def handle_client(conn, addr, rotor):
         conn.close()
         print("Gpredict disconnected, exiting.")
 
+
 def start_server():
     rotor = CarryoutRotor(SERIAL_PORT, SERIAL_BAUDRATE)
     print(f"Carryout antenna connected on {SERIAL_PORT}")
-    print(f"Listening for rotor commands on {GPREDICT_HOST} : {GPREDICT_PORT}")
+    print(f"Listening for rotor commands on {GPREDICT_HOST}:{GPREDICT_PORT}")
 
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -127,6 +132,7 @@ def start_server():
         conn, addr = server.accept()
         conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         threading.Thread(target=handle_client, args=(conn, addr, rotor), daemon=True).start()
+
 
 if __name__ == '__main__':
     start_server()
